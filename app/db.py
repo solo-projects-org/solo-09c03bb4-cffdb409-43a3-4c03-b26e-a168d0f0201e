@@ -1,4 +1,4 @@
-"""SQLite 存储层：批次、跨度(调用记录)、入仓表、配置。单连接 + 锁，WAL 模式。"""
+"""SQLite 存储层：批次、跨度(调用记录)、入仓表、平行管配对、配置。单连接 + 锁，WAL 模式。"""
 import json
 import os
 import sqlite3
@@ -20,7 +20,9 @@ CREATE TABLE IF NOT EXISTS batches (
   sample_ids TEXT NOT NULL,          -- JSON array
   status TEXT NOT NULL DEFAULT 'running',   -- running / done / failed
   finished_at REAL,
-  conclusion TEXT                    -- JSON, 完成结论(含关键链/阻断)
+  conclusion TEXT,                   -- JSON, 完成结论(含关键链/阻断)
+  mode TEXT NOT NULL DEFAULT 'normal',      -- normal / paired(平行管成对入仓)
+  rpd_limit REAL                     -- 配对批次的 RPD 上限(0~2)
 );
 CREATE TABLE IF NOT EXISTS spans (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,6 +51,21 @@ CREATE TABLE IF NOT EXISTS warehouse (
   request_id TEXT NOT NULL,          -- 产生该入仓记录的取数尝试
   UNIQUE(batch_id, sample_id)        -- 幂等：迟到/重复结果不得重复入仓
 );
+CREATE TABLE IF NOT EXISTS pairs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id INTEGER NOT NULL,
+  sample_a TEXT NOT NULL,            -- 平行管①样品号
+  sample_b TEXT NOT NULL,            -- 平行管②样品号
+  rpd_limit REAL NOT NULL,           -- 委托约定的 RPD 上限(0~2)
+  conc_a REAL,                       -- 管①原始测值(取数有效结果)
+  conc_b REAL,                       -- 管②原始测值
+  rpd REAL,                          -- 2|a-b|/(a+b)，两值均为零时记 0
+  decision TEXT NOT NULL DEFAULT 'running',  -- running/stored/rejected/unconfirmed
+  reason TEXT NOT NULL DEFAULT '',   -- 判定依据(超限/明确拒绝/未确认原因)
+  created_at REAL NOT NULL,
+  decided_at REAL                    -- 判定时刻；迟到取数不得改变已定结论
+);
+CREATE INDEX IF NOT EXISTS idx_pairs_batch ON pairs(batch_id);
 CREATE TABLE IF NOT EXISTS kv (
   k TEXT PRIMARY KEY,
   v TEXT NOT NULL
@@ -57,6 +74,12 @@ CREATE TABLE IF NOT EXISTS kv (
 
 with _lock:
     _conn.executescript(SCHEMA)
+    # 旧库迁移：补齐批次表的配对字段
+    cols = {r[1] for r in _conn.execute("PRAGMA table_info(batches)")}
+    if "mode" not in cols:
+        _conn.execute("ALTER TABLE batches ADD COLUMN mode TEXT NOT NULL DEFAULT 'normal'")
+    if "rpd_limit" not in cols:
+        _conn.execute("ALTER TABLE batches ADD COLUMN rpd_limit REAL")
     _conn.commit()
 
 
@@ -124,6 +147,52 @@ def warehouse_insert(batch_id, sample_id, concentration, request_id):
         " VALUES(?,?,?,?,?)",
         (batch_id, sample_id, concentration, time.time(), request_id))
     return cur.rowcount == 1
+
+
+def warehouse_insert_pair(batch_id, sample_a, conc_a, req_a, sample_b, conc_b, req_b):
+    """平行管成对入仓：两条原始测值在同一事务写入，任一失败整体回滚，
+    绝不留下半对。返回 True 表示两条均已落库。"""
+    with _lock:
+        try:
+            _conn.commit()  # 兜底：确保没有遗留事务，随后显式开启本事务
+            _conn.execute("BEGIN IMMEDIATE")
+            n = 0
+            now = time.time()
+            for sid, conc, req in ((sample_a, conc_a, req_a), (sample_b, conc_b, req_b)):
+                cur = _conn.execute(
+                    "INSERT OR IGNORE INTO warehouse"
+                    "(batch_id,sample_id,concentration,stored_at,request_id)"
+                    " VALUES(?,?,?,?,?)", (batch_id, sid, conc, now, req))
+                n += cur.rowcount
+            if n != 2:
+                _conn.execute("ROLLBACK")
+                return False
+            _conn.execute("COMMIT")
+            return True
+        except Exception:
+            try:
+                _conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            return False
+
+
+# ---------- 平行管配对 ----------
+
+def pair_create(batch_id, sample_a, sample_b, rpd_limit):
+    cur = execute(
+        "INSERT INTO pairs(batch_id,sample_a,sample_b,rpd_limit,decision,created_at)"
+        " VALUES(?,?,?,?,'running',?)",
+        (batch_id, sample_a, sample_b, rpd_limit, time.time()))
+    return cur.lastrowid
+
+
+def pair_decide(pair_id, conc_a, conc_b, rpd, decision, reason):
+    """判定只写一次：已定的配对结论不会被迟到取数或重复判定覆盖。"""
+    execute(
+        "UPDATE pairs SET conc_a=?, conc_b=?, rpd=?, decision=?, reason=?, decided_at=?"
+        " WHERE id=? AND decision='running'",
+        (conc_a, conc_b, rpd, decision, reason, time.time(), pair_id))
 
 
 # ---------- 配置 ----------

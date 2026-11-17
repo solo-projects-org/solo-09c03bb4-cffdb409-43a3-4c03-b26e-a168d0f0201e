@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """端到端自测：需先启动三服务(默认编排端 http://localhost:8000)。
 覆盖:正常入仓、源站慢(超时/迟到/不重入仓)、等名额、质控慢瓶颈迁移、
-源站首次失败、质控失败阻断、NEG/MIX 钩子、多批交错不串记录。"""
+源站首次失败、质控失败阻断、NEG/MIX 钩子、多批交错不串记录、
+平行管配对(合格成对入仓/RPD 超限/双零/边界/明确拒绝/未确认/迟到不改结论/参数校验)。"""
+import hashlib
 import json
 import sys
 import time
@@ -18,6 +20,12 @@ def check(name, cond, extra=""):
         FAILS.append(name)
 
 
+def source_conc(sid):
+    """与 source_app 相同的确定性浓度(仅用于自测构造期望值)。"""
+    h = int(hashlib.md5(sid.encode()).hexdigest()[:8], 16)
+    return round((h % 1000) / 100.0, 2)
+
+
 def set_config(c, **kw):
     r = c.post(f"{BASE}/api/config", json=kw, timeout=10)
     r.raise_for_status()
@@ -28,6 +36,14 @@ def set_config(c, **kw):
 
 def submit(c, ids):
     r = c.post(f"{BASE}/api/batches", json={"sample_ids": ids}, timeout=10)
+    r.raise_for_status()
+    return r.json()["id"]
+
+
+def submit_pair(c, a, b, rpd_limit):
+    r = c.post(f"{BASE}/api/batches",
+               json={"sample_ids": [a, b], "mode": "paired", "rpd_limit": rpd_limit},
+               timeout=10)
     r.raise_for_status()
     return r.json()["id"]
 
@@ -148,6 +164,100 @@ def main():
     pref2 = {w["sample_id"] for w in d2["warehouse"]}
     check("入仓样品归属正确", all(x.startswith("X1-") for x in pref1)
           and all(x.startswith("X2-") for x in pref2))
+
+    # ---- 平行管配对：同一委托两支平行管成对入仓 ----
+    # 确定性浓度(与源站同一哈希):PZ-528→1.00, PZ-2473→1.10, PZ-330/PZ-1120→0.00
+    set_config(c, source_delay_ms=300, source_slots=3, source_fail_first=False,
+               qc_nonneg_delay_ms=200, qc_nonneg_fail_first=False,
+               qc_match_delay_ms=200, qc_match_fail_first=False,
+               client_timeout_ms=2000, max_attempts=3)
+    CA, CB = source_conc("PZ-528"), source_conc("PZ-2473")
+    RPD = 2 * abs(CA - CB) / (CA + CB)
+
+    # 9. 配对合格：RPD 未超上限 → 两条原始测值同时入仓
+    d = wait_batch(c, submit_pair(c, "PZ-528", "PZ-2473", 0.1))
+    p = (d["conclusion"].get("pairs") or [{}])[0]
+    check("配对合格批次完成", d["batch"]["status"] == "done")
+    check("配对合格两条同时入仓", len(d["warehouse"]) == 2, f"{len(d['warehouse'])}/2")
+    check("配对结论为合格入仓", p.get("decision") == "stored", str(p.get("decision")))
+    check("配对 RPD 计算正确", p.get("rpd") is not None and abs(p["rpd"] - RPD) < 1e-6,
+          f"{p.get('rpd')} vs {RPD}")
+    check("配对浓度证据齐全", p.get("conc_a") == CA and p.get("conc_b") == CB,
+          f"{p.get('conc_a')},{p.get('conc_b')}")
+    check("配对详情含配对比较跨度", bool(spans_of(d, stage="pair_compare")))
+
+    # 10. RPD 超限：整对不入仓
+    d = wait_batch(c, submit_pair(c, "PZ-528", "PZ-2473", 0.05))
+    p = (d["conclusion"].get("pairs") or [{}])[0]
+    check("超限批次标记失败", d["batch"]["status"] == "failed")
+    check("超限明确拒绝", p.get("decision") == "rejected", str(p.get("decision")))
+    check("超限原因如实记录", "超上限" in (p.get("reason") or ""), str(p.get("reason"))[:60])
+    check("超限整对不入仓(零记录)", len(d["warehouse"]) == 0)
+    check("超限批次无成功链", d["conclusion"]["chain"] is None)
+
+    # 11. RPD 恰等于上限：不算超限 → 合格入仓
+    d = wait_batch(c, submit_pair(c, "PZ-528", "PZ-2473", RPD))
+    p = (d["conclusion"].get("pairs") or [{}])[0]
+    check("RPD 等于上限仍合格", p.get("decision") == "stored" and len(d["warehouse"]) == 2,
+          f"decision={p.get('decision')}")
+
+    # 12. 两值均为零：RPD 记为零,上限 0 也合格
+    d = wait_batch(c, submit_pair(c, "PZ-330", "PZ-1120", 0))
+    p = (d["conclusion"].get("pairs") or [{}])[0]
+    check("双零管 RPD 记为零", p.get("rpd") == 0, str(p.get("rpd")))
+    check("双零管上限0仍合格入仓", p.get("decision") == "stored" and len(d["warehouse"]) == 2)
+
+    # 13. 任一管被质控明确拒绝(NEG 负浓度) → 整对不入仓
+    d = wait_batch(c, submit_pair(c, "PAIR-NEG-1", "PZ-528", 2))
+    p = (d["conclusion"].get("pairs") or [{}])[0]
+    check("明确拒绝批次失败", d["batch"]["status"] == "failed")
+    check("质控明确拒绝判定为 rejected", p.get("decision") == "rejected", str(p.get("decision")))
+    check("明确拒绝零入仓", len(d["warehouse"]) == 0)
+
+    # 14. 质控报错(注入 500) → 未确认,不得冒充明确拒绝
+    set_config(c, qc_nonneg_fail_first=True)
+    d = wait_batch(c, submit_pair(c, "PZ-454", "PZ-241", 2))
+    p = (d["conclusion"].get("pairs") or [{}])[0]
+    check("质控报错判定为未确认", p.get("decision") == "unconfirmed", str(p.get("decision")))
+    check("未确认未冒充明确拒绝", p.get("decision") != "rejected")
+    check("未确认零入仓", len(d["warehouse"]) == 0)
+    set_config(c, qc_nonneg_fail_first=False)
+
+    # 15. 取数失败(首次失败+只试 1 次) → 未确认
+    set_config(c, source_fail_first=True, max_attempts=1)
+    d = wait_batch(c, submit_pair(c, "PZ-2772", "PZ-2503", 2))
+    p = (d["conclusion"].get("pairs") or [{}])[0]
+    check("取数失败判定为未确认", p.get("decision") == "unconfirmed", str(p.get("decision")))
+    check("取数失败零入仓", len(d["warehouse"]) == 0)
+    set_config(c, source_fail_first=False, max_attempts=3)
+
+    # 16. 慢源配对：超时重试后仍合格入仓,迟到不重复入仓、不改已定结论
+    set_config(c, source_delay_ms=2600, client_timeout_ms=900, max_attempts=3)
+    d = wait_batch(c, submit_pair(c, "PZ-1141", "PZ-3701", 2), timeout=90)
+    p = (d["conclusion"].get("pairs") or [{}])[0]
+    fetch = spans_of(d, stage="fetch", side="client")
+    check("慢源配对仍合格入仓", p.get("decision") == "stored" and len(d["warehouse"]) == 2,
+          f"decision={p.get('decision')} wh={len(d['warehouse'])}")
+    check("慢源配对产生迟到尝试", any(s["status"] == "late" for s in fetch))
+    check("迟到未重复入仓(恰 2 条)", len(d["warehouse"]) == 2)
+    check("配对判定只下一次", len(d["conclusion"].get("pairs") or []) == 1)
+    set_config(c, source_delay_ms=300, client_timeout_ms=2000)
+
+    # 17. 配对参数校验：相同样品号/超限上限/缺上限均被拒
+    r = c.post(f"{BASE}/api/batches",
+               json={"sample_ids": ["SAME", "SAME"], "mode": "paired", "rpd_limit": 1}, timeout=10)
+    check("相同样品号被拒(400)", r.status_code == 400, str(r.status_code))
+    r = c.post(f"{BASE}/api/batches",
+               json={"sample_ids": ["A1", "A2"], "mode": "paired", "rpd_limit": 2.5}, timeout=10)
+    check("RPD 上限超 2 被拒(400)", r.status_code == 400, str(r.status_code))
+    r = c.post(f"{BASE}/api/batches",
+               json={"sample_ids": ["A1", "A2"], "mode": "paired"}, timeout=10)
+    check("缺 RPD 上限被拒(400)", r.status_code == 400, str(r.status_code))
+
+    # 18. 普通批次在配对功能上线后照常运行
+    d = wait_batch(c, submit(c, [f"N1-{i}" for i in range(3)]))
+    check("普通批次照常完成", d["batch"]["status"] == "done" and len(d["warehouse"]) == 3)
+    check("普通批次无配对记录", not (d["conclusion"].get("pairs")))
 
     print()
     if FAILS:

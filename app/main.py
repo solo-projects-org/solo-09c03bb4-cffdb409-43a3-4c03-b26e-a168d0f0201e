@@ -30,12 +30,26 @@ async def create_batch(body: dict = Body(...)):
     ids = list(dict.fromkeys(str(s).strip() for s in raw if str(s).strip()))
     if not ids:
         return JSONResponse({"error": "样品号清单为空"}, status_code=400)
+    mode = str(body.get("mode") or "normal")
+    rpd_limit = None
+    if mode == "paired":
+        # 配对批次：同一委托的两支平行管(两个不同样品号) + RPD 上限(0~2)
+        if len(ids) != 2:
+            return JSONResponse({"error": "配对批次需选择两个不同样品号"}, status_code=400)
+        try:
+            rpd_limit = float(body.get("rpd_limit"))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "配对批次须填写 RPD 上限(0~2)"}, status_code=400)
+        if not (0.0 <= rpd_limit <= 2.0):
+            return JSONResponse({"error": "RPD 上限须在 0~2 之间"}, status_code=400)
+    elif mode != "normal":
+        return JSONResponse({"error": f"未知批次类型: {mode}"}, status_code=400)
     cur = db.execute(
-        "INSERT INTO batches(created_at, sample_ids, status) VALUES(?,?,?)",
-        (time.time(), json.dumps(ids, ensure_ascii=False), "running"))
+        "INSERT INTO batches(created_at, sample_ids, status, mode, rpd_limit) VALUES(?,?,?,?,?)",
+        (time.time(), json.dumps(ids, ensure_ascii=False), "running", mode, rpd_limit))
     bid = cur.lastrowid
-    asyncio.create_task(pipeline.run_batch(bid, ids))
-    return {"id": bid, "samples": len(ids)}
+    asyncio.create_task(pipeline.run_batch(bid, ids, mode, rpd_limit))
+    return {"id": bid, "samples": len(ids), "mode": mode}
 
 
 @app.get("/api/batches")
@@ -44,11 +58,14 @@ async def list_batches():
     out = []
     for b in rows:
         item = {"id": b["id"], "status": b["status"], "created_at": b["created_at"],
-                "finished_at": b["finished_at"], "samples": len(json.loads(b["sample_ids"]))}
+                "finished_at": b["finished_at"], "samples": len(json.loads(b["sample_ids"])),
+                "mode": b["mode"]}
         if b["conclusion"]:
             c = json.loads(b["conclusion"])
             item.update({"bottleneck": c.get("bottleneck"), "wall_s": c.get("wall_s"),
                          "stored": c.get("samples_stored")})
+            if c.get("pairs"):
+                item["pair_decision"] = c["pairs"][0].get("decision")
         out.append(item)
     return out
 
@@ -60,13 +77,16 @@ async def batch_detail(bid: int):
         return JSONResponse({"error": "not found"}, status_code=404)
     spans = db.query("SELECT * FROM spans WHERE batch_id=? ORDER BY start_ts,id", (bid,))
     wh = db.query("SELECT * FROM warehouse WHERE batch_id=? ORDER BY stored_at", (bid,))
+    pairs = db.query("SELECT * FROM pairs WHERE batch_id=? ORDER BY id", (bid,))
     # 结论按当前记录实时重算：迟到跨度随时可能补记，看到的一定与记录一致
     concl = analysis.analyze(bid) if spans else None
     return {
         "batch": {"id": b["id"], "status": b["status"], "created_at": b["created_at"],
-                  "finished_at": b["finished_at"], "sample_ids": json.loads(b["sample_ids"])},
+                  "finished_at": b["finished_at"], "sample_ids": json.loads(b["sample_ids"]),
+                  "mode": b["mode"], "rpd_limit": b["rpd_limit"]},
         "spans": spans,
         "warehouse": wh,
+        "pairs": pairs,
         "conclusion": concl,
     }
 

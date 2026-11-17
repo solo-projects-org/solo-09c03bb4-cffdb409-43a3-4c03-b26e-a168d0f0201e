@@ -8,7 +8,15 @@ STAGE_LABELS = {
     "fetch": "取数",
     "qc_nonneg": "质控①非负值",
     "qc_match": "质控②样品号对应",
+    "pair_compare": "配对比较",
     "warehouse": "入仓",
+}
+
+DECISION_LABELS = {
+    "stored": "合格入仓",
+    "rejected": "明确拒绝·整对不入仓",
+    "unconfirmed": "未确认·整对不入仓",
+    "running": "判定中",
 }
 
 
@@ -38,8 +46,10 @@ def analyze(batch_id):
     if not batch:
         return {"status": "failed", "text": "批次不存在"}
     sample_ids = list(dict.fromkeys(json.loads(batch["sample_ids"])))
+    mode = batch["mode"] if "mode" in batch.keys() else "normal"
     spans = db.query("SELECT * FROM spans WHERE batch_id=? ORDER BY start_ts,id", (batch_id,))
     wh = db.query("SELECT * FROM warehouse WHERE batch_id=?", (batch_id,))
+    pairs = db.query("SELECT * FROM pairs WHERE batch_id=? ORDER BY id", (batch_id,))
     client = [s for s in spans if s["side"] == "client"]
     server_by_req = {s["request_id"]: s for s in spans if s["side"] == "server"}
 
@@ -51,7 +61,7 @@ def analyze(batch_id):
 
     # 各阶段统计：sum(各次耗时求和) 与 wall(墙钟跨度) 分开，并行/重叠不相加
     per_stage = {}
-    for st in ("fetch", "qc_nonneg", "qc_match", "warehouse"):
+    for st in ("fetch", "qc_nonneg", "qc_match", "pair_compare", "warehouse"):
         ss = [s for s in client if s["stage"] == st and s["end_ts"] is not None]
         if not ss:
             continue
@@ -85,6 +95,7 @@ def analyze(batch_id):
 
     result = {
         "status": "done" if done else "failed",
+        "mode": mode,
         "t0": t0, "t1": t1, "wall_s": _f(t1 - t0),
         "samples_total": len(sample_ids),
         "samples_stored": len(wh_by_sample),
@@ -95,6 +106,14 @@ def analyze(batch_id):
         "bottleneck": bottleneck,
         "chain": None,
         "blocking": None,
+        "pairs": [
+            {"id": p["id"], "sample_a": p["sample_a"], "sample_b": p["sample_b"],
+             "conc_a": p["conc_a"], "conc_b": p["conc_b"], "rpd": p["rpd"],
+             "rpd_limit": p["rpd_limit"], "decision": p["decision"],
+             "decision_label": DECISION_LABELS.get(p["decision"], p["decision"]),
+             "reason": p["reason"], "decided_at": p["decided_at"]}
+            for p in pairs
+        ],
     }
 
     if done:
@@ -140,8 +159,14 @@ def analyze(batch_id):
             d = _f(seg["end"] - seg["start"])
             bits.append(f"{seg['label']} {d:.3f}s" + (f"({seg['note']})" if seg.get("note") else ""))
         fr = per_stage.get("fetch", {})
+        head = f"批次#{batch_id} 已完成:{len(wh_by_sample)}/{len(sample_ids)} 样品入仓"
+        if mode == "paired" and pairs:
+            p = pairs[0]
+            head = (f"配对批次#{batch_id} 已完成:平行管 {p['sample_a']}↔{p['sample_b']} "
+                    f"双管合格成对入仓(RPD={p['rpd']}≤上限{p['rpd_limit']},"
+                    f"两条原始测值同一事务写入)")
         result["text"] = (
-            f"批次#{batch_id} 已完成:{len(wh_by_sample)}/{len(sample_ids)} 样品入仓"
+            f"{head}"
             f"(入仓记录 {len(wh)} 条、跨服务调用 {len(client)} 次,结论以实际记录为据)。"
             f"墙钟总耗时 {_f(t1 - t0)}s。"
             f"决定完成时间的关键链(样品 {sid}): " + " → ".join(bits) + "。"
@@ -153,37 +178,55 @@ def analyze(batch_id):
             f"(其中曾超时放弃 {fr.get('gave_up', 0)} 次)。")
     else:
         blocking = []
-        for sid in sample_ids:
-            if sid in wh_by_sample:
-                continue
-            sps = [s for s in client if s["sample_id"] == sid]
-            fetches = [s for s in sps if s["stage"] == "fetch"]
-            eff = [s for s in fetches if s["status"] == "effective"]
-            if fetches and not eff:
-                last = max(fetches, key=lambda s: s["start_ts"])
-                tries = "、".join(f"#{s['attempt']}:{s['status']}"
-                                 for s in sorted(fetches, key=lambda x: x["attempt"]))
-                blocking.append({"sample_id": sid, "stage": "fetch",
-                                 "detail": f"取数 {len(fetches)} 次尝试均未成功({tries});"
-                                           f"最后错误:{_err_of(last)}"})
-                continue
-            bad_qc = [s for s in sps if s["stage"] in ("qc_nonneg", "qc_match")
-                      and s["status"] != "ok"]
-            if bad_qc:
-                s = bad_qc[0]
-                blocking.append({"sample_id": sid, "stage": s["stage"],
-                                 "detail": f"{STAGE_LABELS[s['stage']]}未通过/失败:{_err_of(s)}"})
-                continue
-            if not fetches:
-                blocking.append({"sample_id": sid, "stage": "fetch",
-                                 "detail": "尚无取数记录(批次可能仍在运行)"})
-            else:
-                blocking.append({"sample_id": sid, "stage": "warehouse",
-                                 "detail": "入仓环节未完成"})
+        if mode == "paired" and pairs:
+            # 配对批次：阻断/未确认以配对判定为据，不逐管猜测
+            for p in pairs:
+                if p["decision"] == "stored":
+                    continue
+                if p["decision"] == "running":
+                    blocking.append({"sample_id": f"{p['sample_a']}+{p['sample_b']}",
+                                     "stage": "pair_compare",
+                                     "detail": "配对尚未判定(批次可能仍在运行或中断)"})
+                else:
+                    blocking.append({"sample_id": f"{p['sample_a']}+{p['sample_b']}",
+                                     "stage": "pair_compare",
+                                     "detail": f"{DECISION_LABELS.get(p['decision'], p['decision'])}:"
+                                               f"{p['reason']}"})
+        else:
+            for sid in sample_ids:
+                if sid in wh_by_sample:
+                    continue
+                sps = [s for s in client if s["sample_id"] == sid]
+                fetches = [s for s in sps if s["stage"] == "fetch"]
+                eff = [s for s in fetches if s["status"] == "effective"]
+                if fetches and not eff:
+                    last = max(fetches, key=lambda s: s["start_ts"])
+                    tries = "、".join(f"#{s['attempt']}:{s['status']}"
+                                     for s in sorted(fetches, key=lambda x: x["attempt"]))
+                    blocking.append({"sample_id": sid, "stage": "fetch",
+                                     "detail": f"取数 {len(fetches)} 次尝试均未成功({tries});"
+                                               f"最后错误:{_err_of(last)}"})
+                    continue
+                bad_qc = [s for s in sps if s["stage"] in ("qc_nonneg", "qc_match")
+                          and s["status"] != "ok"]
+                if bad_qc:
+                    s = bad_qc[0]
+                    blocking.append({"sample_id": sid, "stage": s["stage"],
+                                     "detail": f"{STAGE_LABELS[s['stage']]}未通过/失败:{_err_of(s)}"})
+                    continue
+                if not fetches:
+                    blocking.append({"sample_id": sid, "stage": "fetch",
+                                     "detail": "尚无取数记录(批次可能仍在运行)"})
+                else:
+                    blocking.append({"sample_id": sid, "stage": "warehouse",
+                                     "detail": "入仓环节未完成"})
         result["blocking"] = blocking
         bl = "；".join(f"样品 {b['sample_id']} 阻断于{STAGE_LABELS.get(b['stage'], b['stage'])}"
                        f"({b['detail']})" for b in blocking) or "无阻断明细"
+        head = f"批次#{batch_id} 未完成:{len(wh_by_sample)}/{len(sample_ids)} 样品入仓"
+        if mode == "paired":
+            head = (f"配对批次#{batch_id} 未完成:平行管整对未入仓"
+                    f"(入仓记录 {len(wh)} 条,成对判定不留半对)")
         result["text"] = (
-            f"批次#{batch_id} 未完成:{len(wh_by_sample)}/{len(sample_ids)} 样品入仓"
-            f"(入仓记录 {len(wh)} 条)。阻断环节: {bl}。失败批次不生成成功链。")
+            f"{head}。阻断/未确认环节: {bl}。失败批次不生成成功链。")
     return result

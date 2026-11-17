@@ -1,4 +1,6 @@
 """批次流水线：取数(超时重试/迟到归类) -> 并行两项质控 -> 幂等入仓。
+配对批次：同一委托的两支平行管各自走取数与两项质控，均明确通过后按
+RPD=2|a-b|/(a+b) 比较浓度，合格则两条原始测值同一事务成对入仓。
 全程真实计时，每次调用一个 span，request_id 跨服务关联。"""
 import asyncio
 import json
@@ -128,6 +130,9 @@ async def _finalize_late(pending):
 # ---------------- 质控(两项并行) ----------------
 
 async def qc_call(batch_id, sample_id, check, payload):
+    """返回三态：'pass' 明确通过 / 'reject' 明确拒绝(回执 pass=false) /
+    'unknown' 未确认(质控报错、HTTP 非 200 或回执缺少 pass 字段)——
+    未确认绝不冒充明确拒绝。"""
     stage = f"qc_{check}"
     req_id = _rid()
     span_id = db.insert_span(batch_id, sample_id, stage, "client", "orchestrator",
@@ -138,17 +143,23 @@ async def qc_call(batch_id, sample_id, check, payload):
         end = time.time()
         if r.status_code == 200:
             res = r.json()
-            ok = bool(res.get("pass"))
-            db.finish_span(span_id, end, "ok" if ok else "failed", {"response": res},
-                           note=None if ok else " 质控判定未通过。")
-            return ok
+            if "pass" in res:
+                ok = bool(res.get("pass"))
+                db.finish_span(span_id, end, "ok" if ok else "failed", {"response": res},
+                               note=None if ok else " 质控明确判定未通过。")
+                return "pass" if ok else "reject"
+            db.finish_span(span_id, end, "failed", {"response": res},
+                           note=" 质控回执缺少 pass 字段，结论未确认。")
+            return "unknown"
         db.finish_span(span_id, end, "failed",
-                       {"status_code": r.status_code, "body": r.text[:200]})
-        return False
+                       {"status_code": r.status_code, "body": r.text[:200]},
+                       note=" 质控服务报错，结论未确认。")
+        return "unknown"
     except Exception as e:
         db.finish_span(span_id, time.time(), "failed",
-                       {"error": f"{type(e).__name__}: {e}"})
-        return False
+                       {"error": f"{type(e).__name__}: {e}"},
+                       note=" 质控调用异常，结论未确认。")
+        return "unknown"
 
 
 # ---------------- 单样品流程 ----------------
@@ -161,11 +172,11 @@ async def process_sample(batch_id, sample_id, cfg):
     returned_id = str(data.get("sample_id"))
     payload = {"sample_id": returned_id, "expected_sample_id": sample_id,
                "concentration": data.get("concentration")}
-    # 两项质控并行：墙钟取较慢者，不相加
+    # 两项质控并行：墙钟取较慢者，不相加；明确通过才算通过
     ok1, ok2 = await asyncio.gather(
         qc_call(batch_id, sample_id, "nonneg", payload),
         qc_call(batch_id, sample_id, "match", payload))
-    if not (ok1 and ok2):
+    if ok1 != "pass" or ok2 != "pass":
         return False
     span_id = db.insert_span(batch_id, sample_id, "warehouse", "client", "orchestrator",
                              1, _rid(), "running", time.time())
@@ -177,11 +188,113 @@ async def process_sample(batch_id, sample_id, cfg):
     return True
 
 
-async def run_batch(batch_id, sample_ids):
+# ---------------- 平行管配对流程 ----------------
+
+def compute_rpd(a, b):
+    """RPD = 2|a-b|/(a+b)；两值均为零时约定记 0。两管均已通过非负质控，故 a+b==0 即同为零。"""
+    a, b = float(a), float(b)
+    if a + b == 0:
+        return 0.0
+    return 2.0 * abs(a - b) / (a + b)
+
+
+async def process_pair(batch_id, sample_a, sample_b, rpd_limit, cfg):
+    """同一委托的两支平行管成对入仓：
+    1) 两管各自沿用取数重试；2) 各走原有两项质控且须均明确通过；
+    3) 按 RPD 比较浓度，超限整对不入仓；
+    4) 任一环节未确认(取数失败/质控报错/回执不明)记 unconfirmed，不冒充明确拒绝；
+    5) 合格时两条原始测值同一事务写入，失败回滚不留半对；
+    6) 判定只下一次，迟到取数不得改变已定配对结果。"""
+    pair_id = db.pair_create(batch_id, sample_a, sample_b, rpd_limit)
+    pair_label = f"{sample_a}+{sample_b}"
+    t0 = time.time()
+    span_id = db.insert_span(batch_id, pair_label, "pair_compare", "client", "orchestrator",
+                             1, _rid(), "running", t0)
+
+    def decide(conc_a, conc_b, rpd, decision, reason, extra=None):
+        db.pair_decide(pair_id, conc_a, conc_b, rpd, decision, reason)
+        status = {"stored": "ok", "rejected": "failed"}.get(decision, "unconfirmed")
+        db.finish_span(span_id, time.time(), status,
+                       {"pair_id": pair_id, "sample_a": sample_a, "sample_b": sample_b,
+                        "conc_a": conc_a, "conc_b": conc_b, "rpd": rpd,
+                        "rpd_limit": rpd_limit, "decision": decision,
+                        "reason": reason, **(extra or {})},
+                       note=f" 配对结论:{reason}")
+        return decision == "stored"
+
+    # 1) 两管并行取数(沿用超时重试；首个有效结果胜出，迟到不入仓)
+    data_a, data_b = await asyncio.gather(fetch_with_retry(batch_id, sample_a, cfg),
+                                          fetch_with_retry(batch_id, sample_b, cfg))
+    if data_a is None or data_b is None:
+        missing = [s for s, d in ((sample_a, data_a), (sample_b, data_b)) if d is None]
+        return decide(None, None, None, "unconfirmed",
+                      f"未确认：管 {'、'.join(missing)} 取数失败(尝试耗尽无有效结果)，"
+                      f"非明确拒绝，整对不入仓。")
+    req_a, req_b = data_a.pop("_req_id"), data_b.pop("_req_id")
+    conc_a, conc_b = data_a.get("concentration"), data_b.get("concentration")
+
+    # 2) 两管 × 两项质控全部并行(沿用原有 nonneg/match 两项)
+    def payload(sample_id, data):
+        return {"sample_id": str(data.get("sample_id")), "expected_sample_id": sample_id,
+                "concentration": data.get("concentration")}
+    ra1, ra2, rb1, rb2 = await asyncio.gather(
+        qc_call(batch_id, sample_a, "nonneg", payload(sample_a, data_a)),
+        qc_call(batch_id, sample_a, "match", payload(sample_a, data_a)),
+        qc_call(batch_id, sample_b, "nonneg", payload(sample_b, data_b)),
+        qc_call(batch_id, sample_b, "match", payload(sample_b, data_b)))
+    results = {f"{sample_a}·质控①非负值": ra1, f"{sample_a}·质控②样品号对应": ra2,
+               f"{sample_b}·质控①非负值": rb1, f"{sample_b}·质控②样品号对应": rb2}
+    unknown = [k for k, v in results.items() if v == "unknown"]
+    if unknown:
+        return decide(_num(conc_a), _num(conc_b), None, "unconfirmed",
+                      f"未确认：质控报错或回执不明({ '、'.join(unknown) })，"
+                      f"不冒充明确拒绝，整对不入仓。")
+    rejected = [k for k, v in results.items() if v == "reject"]
+    if rejected:
+        return decide(_num(conc_a), _num(conc_b), None, "rejected",
+                      f"明确拒绝：{ '、'.join(rejected) } 质控判定未通过，整对不入仓。")
+
+    # 3) 两管四项质控均明确通过 → RPD 比较
+    rpd = compute_rpd(conc_a, conc_b)
+    if rpd > rpd_limit:
+        return decide(_num(conc_a), _num(conc_b), round(rpd, 6), "rejected",
+                      f"明确拒绝：RPD={rpd:.6f} 超上限 {rpd_limit}"
+                      f"(2|{conc_a}-{conc_b}|/({conc_a}+{conc_b}))，整对不入仓。")
+
+    # 4) 合格：两条原始测值同一事务成对入仓，失败回滚不留半对
+    w_start = time.time()
+    inserted = db.warehouse_insert_pair(batch_id, sample_a, conc_a, req_a,
+                                        sample_b, conc_b, req_b)
+    if not inserted:
+        return decide(_num(conc_a), _num(conc_b), round(rpd, 6), "unconfirmed",
+                      "未确认：成对入仓写入失败，事务已整体回滚，未留下半对。")
+    end = time.time()
+    for sid, conc, req in ((sample_a, conc_a, req_a), (sample_b, conc_b, req_b)):
+        wspan = db.insert_span(batch_id, sid, "warehouse", "client", "orchestrator",
+                               1, _rid(), "running", w_start)
+        db.finish_span(wspan, end, "ok",
+                       {"inserted": True, "concentration": conc, "source_request_id": req,
+                        "atomic_pair": pair_label},
+                       note=" 配对原子写入：两条原始测值同一事务入仓。")
+    return decide(_num(conc_a), _num(conc_b), round(rpd, 6), "stored",
+                  f"合格：双管四项质控均明确通过，RPD={rpd:.6f} ≤ 上限 {rpd_limit}，"
+                  f"两条原始测值已同一事务成对入仓。")
+
+
+def _num(x):
+    """浓度数值化(非数值不入 pairs 浓度列，避免脏数据)。"""
+    return x if isinstance(x, (int, float)) and not isinstance(x, bool) else None
+
+
+async def run_batch(batch_id, sample_ids, mode="normal", rpd_limit=None):
     cfg = db.get_config()  # 批次开始时快照配置，批内一致
     try:
-        await asyncio.gather(*(process_sample(batch_id, s, cfg) for s in sample_ids),
-                             return_exceptions=True)
+        if mode == "paired":
+            # 配对批次：恰两支不同样品号构成一对，成对判定、成对入仓
+            await process_pair(batch_id, sample_ids[0], sample_ids[1], rpd_limit, cfg)
+        else:
+            await asyncio.gather(*(process_sample(batch_id, s, cfg) for s in sample_ids),
+                                 return_exceptions=True)
     except Exception:
         pass
     # 等在途的迟到尝试收尾(有 httpx 硬超时兜底)，使定稿结论如实包含迟到记录

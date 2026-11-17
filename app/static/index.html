@@ -32,6 +32,7 @@
   tr.clickable:hover { background: #ddf4ff; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; color: #fff; }
   .st-running { background: #1e88e5; } .st-done { background: #2e7d32; } .st-failed { background: #c62828; }
+  .st-unconfirmed { background: #6e5494; }
   .muted { color: #57606a; } .mono { font-family: ui-monospace, monospace; }
   .concl { background: #f0f6ff; border-left: 4px solid #1f6feb; padding: 8px 12px; border-radius: 4px; }
   .concl.fail { background: #fff0f0; border-left-color: #c62828; }
@@ -47,6 +48,7 @@
   .sp-effective { background: #2e7d32; } .sp-ok { background: #26a69a; }
   .sp-failed { background: #c62828; } .sp-timeout { background: #ef6c00; }
   .sp-late { background: #9e9e9e; } .sp-running { background: #1e88e5; }
+  .sp-unconfirmed { background: #6e5494; }
   .wf-axis { position: relative; height: 16px; margin-left: 245px; margin-right: 70px;
              font-size: 11px; color: #57606a; }
   .wf-axis span { position: absolute; transform: translateX(-50%); }
@@ -97,12 +99,23 @@ S1006</textarea>
     <span class="muted" style="font-size:12px;margin-left:8px">
       演示钩子:样品号含 NEG → 负浓度(质控①不通过);含 MIX → 返回错位样品号(质控②不通过)</span>
   </div>
+  <div style="margin-top:12px;border-top:1px dashed var(--bd);padding-top:10px">
+    <b>平行管配对提交</b><span class="muted" style="font-size:12px;margin-left:6px">
+      同一委托的两支平行管成对入仓:两管各自取数+两项质控均明确通过后,按 RPD=2|a-b|/(a+b) 比较浓度,
+      超限或明确拒绝整对不入仓,未确认不冒充拒绝;合格时两条原始测值同一事务写入</span>
+    <div style="display:flex;gap:10px;align-items:center;margin-top:6px;flex-wrap:wrap">
+      <label><span>管①样品号</span><input type="text" id="pairA" style="width:110px;padding:3px 6px;border:1px solid var(--bd);border-radius:6px" value="PZ-528"></label>
+      <label><span>管②样品号</span><input type="text" id="pairB" style="width:110px;padding:3px 6px;border:1px solid var(--bd);border-radius:6px" value="PZ-2473"></label>
+      <label><span>RPD 上限(0~2)</span><input type="number" id="rpdLimit" min="0" max="2" step="0.01" value="0.1"></label>
+      <button onclick="submitPair()">提交配对批次</button>
+    </div>
+  </div>
 </section>
 
 <section>
   <h2>③ 批次列表(自动刷新;多批交错运行,记录互不串)</h2>
   <table id="batchTable">
-    <thead><tr><th>批次</th><th>状态</th><th>样品数</th><th>入仓</th><th>墙钟 s</th>
+    <thead><tr><th>批次</th><th>类型</th><th>状态</th><th>样品数</th><th>入仓</th><th>墙钟 s</th>
       <th>瓶颈判定</th><th>提交时间</th><th>操作</th></tr></thead>
     <tbody></tbody>
   </table>
@@ -111,6 +124,7 @@ S1006</textarea>
 <section id="detail" hidden>
   <h2 id="detailTitle">批次详情</h2>
   <div id="conclBox"></div>
+  <div id="pairBox" style="margin-top:10px"></div>
   <div id="chainBox" style="margin-top:10px"></div>
   <div id="stageBox" style="margin-top:10px"></div>
   <h2 style="margin-top:14px">跨服务时间线(条块=一次真实调用;黄框=关键链)</h2>
@@ -118,6 +132,7 @@ S1006</textarea>
     <span><i class="sp-effective"></i>有效尝试</span><span><i class="sp-ok"></i>正常(质控/入仓)</span>
     <span><i class="sp-failed"></i>失败/未通过</span><span><i class="sp-timeout"></i>超时放弃</span>
     <span><i class="sp-late"></i>迟到(未采用)</span><span><i class="sp-running"></i>进行中</span>
+    <span><i class="sp-unconfirmed"></i>未确认</span>
     <span class="muted">半透明细条=服务端上报跨度(含等名额)</span>
   </div>
   <div class="wf" id="wf"></div>
@@ -128,8 +143,13 @@ S1006</textarea>
 </main>
 
 <script>
-const STAGE_LABEL = {fetch:'取数', qc_nonneg:'质控①非负', qc_match:'质控②对应', warehouse:'入仓'};
-const STAGE_ORDER = {fetch:0, qc_nonneg:1, qc_match:2, warehouse:3};
+const STAGE_LABEL = {fetch:'取数', qc_nonneg:'质控①非负', qc_match:'质控②对应',
+                     pair_compare:'配对比较', warehouse:'入仓'};
+const STAGE_ORDER = {fetch:0, qc_nonneg:1, qc_match:2, pair_compare:3, warehouse:4};
+const DECISION_LABEL = {stored:'合格入仓', rejected:'明确拒绝·整对不入仓',
+                        unconfirmed:'未确认·整对不入仓', running:'判定中'};
+const DECISION_CLASS = {stored:'st-done', rejected:'st-failed',
+                        unconfirmed:'st-unconfirmed', running:'st-running'};
 let currentBatch = null, currentDetail = null;
 
 function fmtTs(t){ if(!t) return '-'; const d=new Date(t*1000);
@@ -162,11 +182,24 @@ async function submitBatch(){
   if(r.id){ openBatch(r.id); refreshBatches(); } else alert(r.error||'提交失败');
 }
 
+async function submitPair(){
+  const a = document.getElementById('pairA').value.trim();
+  const b = document.getElementById('pairB').value.trim();
+  const lim = Number(document.getElementById('rpdLimit').value);
+  if(!a || !b || a===b){ alert('配对批次需选择两个不同样品号'); return; }
+  if(isNaN(lim) || lim<0 || lim>2){ alert('RPD 上限须在 0~2 之间'); return; }
+  const r = await (await fetch('/api/batches',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({sample_ids:[a,b], mode:'paired', rpd_limit:lim})})).json();
+  if(r.id){ openBatch(r.id); refreshBatches(); } else alert(r.error||'提交失败');
+}
+
 async function refreshBatches(){
   const rows = await (await fetch('/api/batches')).json();
   const tb = document.querySelector('#batchTable tbody');
   tb.innerHTML = rows.map(b=>`<tr class="clickable" onclick="openBatch(${b.id})">
-    <td>#${b.id}</td><td><span class="pill st-${b.status}">${b.status}</span></td>
+    <td>#${b.id}</td><td>${b.mode==='paired'?'配对':'普通'}</td>
+    <td><span class="pill st-${b.status}">${b.status}</span></td>
     <td>${b.samples}</td><td>${b.stored??'-'}</td><td>${b.wall_s??'-'}</td>
     <td>${b.bottleneck??'-'}</td><td class="mono">${fmtTs(b.created_at)}</td>
     <td><button class="ghost" onclick="event.stopPropagation();openBatch(${b.id})">详情</button></td>
@@ -183,8 +216,8 @@ async function loadDetail(id){
   currentDetail = d;
   document.getElementById('detail').hidden = false;
   document.getElementById('detailTitle').textContent =
-    `批次 #${id} 详情(状态 ${d.batch.status},样品 ${d.batch.sample_ids.length} 个)`;
-  renderConclusion(d); renderChain(d); renderStages(d); renderWaterfall(d);
+    `批次 #${id} 详情(${d.batch.mode==='paired'?'配对批次,':'普通批次,'}状态 ${d.batch.status},样品 ${d.batch.sample_ids.length} 个)`;
+  renderConclusion(d); renderPairs(d); renderChain(d); renderStages(d); renderWaterfall(d);
   renderSpans(d); renderWarehouse(d);
 }
 
@@ -194,6 +227,27 @@ function renderConclusion(d){
     (d.batch.status==='running' || !c)
     ? `<div class="concl">批次运行中,结论待定稿…(已完成阶段见下方时间线)</div>`
     : `<div class="concl ${c.status==='done'?'':'fail'}">${c.text}</div>`;
+}
+
+function renderPairs(d){
+  const box = document.getElementById('pairBox');
+  const ps = (d.conclusion && d.conclusion.pairs) || d.pairs || [];
+  if(!ps.length){ box.innerHTML=''; return; }
+  const rows = ps.map(p=>{
+    const dec = p.decision, label = p.decision_label || DECISION_LABEL[dec] || dec;
+    const cls = DECISION_CLASS[dec] || 'st-running';
+    return `<tr><td class="mono">${p.sample_a}</td><td>${p.conc_a??'-'}</td>
+      <td class="mono">${p.sample_b}</td><td>${p.conc_b??'-'}</td>
+      <td>${p.rpd??'-'}</td><td>${p.rpd_limit}</td>
+      <td><span class="pill ${cls}">${label}</span></td>
+      <td>${p.reason||''}</td>
+      <td class="mono">${p.decided_at?fmtTs(p.decided_at):'-'}</td></tr>`;
+  }).join('');
+  box.innerHTML =
+    `<b>平行管配对结论(两管取数/质控证据见下方时间线与调用明细;判定只下一次,迟到取数不改变结论):</b>
+     <table><thead><tr><th>管①样品</th><th>管①浓度</th><th>管②样品</th><th>管②浓度</th>
+     <th>RPD</th><th>上限</th><th>配对结论</th><th>判定依据</th><th>判定时刻</th></tr></thead>
+     <tbody>${rows}</tbody></table>`;
 }
 
 function renderChain(d){
@@ -299,9 +353,13 @@ function renderWarehouse(d){
 
 async function rerun(){
   if(!currentDetail) return;
+  const body = {sample_ids:currentDetail.batch.sample_ids};
+  if(currentDetail.batch.mode==='paired'){
+    body.mode = 'paired';
+    body.rpd_limit = currentDetail.batch.rpd_limit;
+  }
   const r = await (await fetch('/api/batches',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({sample_ids:currentDetail.batch.sample_ids})})).json();
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})).json();
   if(r.id){ openBatch(r.id); refreshBatches(); }
 }
 
