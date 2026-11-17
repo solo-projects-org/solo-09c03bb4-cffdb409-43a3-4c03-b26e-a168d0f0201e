@@ -1,0 +1,38 @@
+services:
+  orchestrator:                # 诊断网页 + 流程编排(取数→并行质控→入仓)
+    build: ./app
+    ports:
+      - "8000:8000"
+    environment:
+      SOURCE_URL: http://source:8000
+      QC_URL: http://qc:8000
+      DB_PATH: /data/orch.db
+    volumes:
+      - orch-data:/data
+    depends_on:
+      source:
+        condition: service_started
+      qc:
+        condition: service_started
+
+  source:                      # 独立检验源：返回样品号+浓度；名额槽位/延迟/首次失败可调
+    build: ./source_app
+    ports:
+      - "8001:8000"            # 暴露便于单独排查，网页操作只需 8000
+    environment:
+      ORCH_URL: http://orchestrator:8000
+      SOURCE_DELAY_MS: "300"
+      SOURCE_SLOTS: "3"
+      SOURCE_FAIL_FIRST: "0"
+
+  qc:                          # 质控服务：①非负值 ②样品号对应，两项独立调延迟/首次失败
+    build: ./qc_app
+    ports:
+      - "8002:8000"
+    environment:
+      ORCH_URL: http://orchestrator:8000
+      QC_NONNEG_DELAY_MS: "200"
+      QC_MATCH_DELAY_MS: "200"
+
+volumes:
+  orch-data:

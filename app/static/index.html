@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>样品入仓链路诊断</title>
+<style>
+  :root { --bd:#d0d7de; --bg:#f6f8fa; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+         margin: 0; background: var(--bg); color: #1f2328; font-size: 14px; }
+  header { background: #0d419d; color: #fff; padding: 10px 18px; }
+  header h1 { font-size: 17px; margin: 0; }
+  header small { opacity: .8; }
+  main { max-width: 1180px; margin: 14px auto; padding: 0 12px; }
+  section { background: #fff; border: 1px solid var(--bd); border-radius: 8px;
+            padding: 12px 14px; margin-bottom: 14px; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); gap: 8px 16px; }
+  label { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  label span { color: #57606a; }
+  input[type=number] { width: 90px; padding: 3px 6px; border: 1px solid var(--bd); border-radius: 6px; }
+  button { background: #1f6feb; color: #fff; border: 0; border-radius: 6px;
+           padding: 6px 14px; cursor: pointer; font-size: 13px; }
+  button.ghost { background: #eaeef2; color: #1f2328; }
+  button:hover { filter: brightness(1.08); }
+  textarea { width: 100%; min-height: 64px; border: 1px solid var(--bd); border-radius: 6px;
+             padding: 6px; font-family: ui-monospace, monospace; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid var(--bd); padding: 4px 8px; text-align: left; font-size: 13px; }
+  th { background: var(--bg); }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover { background: #ddf4ff; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; color: #fff; }
+  .st-running { background: #1e88e5; } .st-done { background: #2e7d32; } .st-failed { background: #c62828; }
+  .muted { color: #57606a; } .mono { font-family: ui-monospace, monospace; }
+  .concl { background: #f0f6ff; border-left: 4px solid #1f6feb; padding: 8px 12px; border-radius: 4px; }
+  .concl.fail { background: #fff0f0; border-left-color: #c62828; }
+  /* 时间线 */
+  .wf { position: relative; margin-top: 8px; }
+  .wf-row { position: relative; height: 22px; border-bottom: 1px dashed #eee; }
+  .wf-label { position: absolute; left: 0; top: 3px; width: 235px; overflow: hidden;
+              text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: #374151; }
+  .wf-track { position: absolute; left: 245px; right: 70px; top: 0; bottom: 0; }
+  .wf-bar { position: absolute; top: 4px; height: 13px; border-radius: 3px; min-width: 2px; }
+  .wf-bar.server { top: 8px; height: 7px; opacity: .55; }
+  .wf-bar.crit { outline: 2px solid #ffd33d; outline-offset: 1px; z-index: 2; }
+  .sp-effective { background: #2e7d32; } .sp-ok { background: #26a69a; }
+  .sp-failed { background: #c62828; } .sp-timeout { background: #ef6c00; }
+  .sp-late { background: #9e9e9e; } .sp-running { background: #1e88e5; }
+  .wf-axis { position: relative; height: 16px; margin-left: 245px; margin-right: 70px;
+             font-size: 11px; color: #57606a; }
+  .wf-axis span { position: absolute; transform: translateX(-50%); }
+  .legend span { display: inline-block; margin-right: 12px; font-size: 12px; }
+  .legend i { display: inline-block; width: 11px; height: 11px; border-radius: 2px;
+              margin-right: 4px; vertical-align: -1px; }
+  .chain-exec { color: #2e7d32; font-weight: 600; } .chain-wait { color: #b26a00; font-weight: 600; }
+  .hint { background: #fff8e6; border: 1px solid #f0d58c; border-radius: 6px;
+          padding: 6px 10px; font-size: 12px; margin-top: 8px; }
+  #pushResult { font-size: 12px; margin-left: 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>样品入仓链路诊断 <small>查清样品迟迟未入仓:等名额 / 源站慢 / 质控拖延</small></h1>
+</header>
+<main>
+<section>
+  <h2>① 运行参数(可实时调慢源站或某一项质控,再重跑对比瓶颈)</h2>
+  <div class="grid" id="cfgForm">
+    <label><span>源站执行延迟 ms</span><input type="number" id="source_delay_ms" min="0"></label>
+    <label><span>源站并行名额</span><input type="number" id="source_slots" min="1"></label>
+    <label><span>源站首次失败</span><input type="checkbox" id="source_fail_first"></label>
+    <label><span>质控①非负 延迟 ms</span><input type="number" id="qc_nonneg_delay_ms" min="0"></label>
+    <label><span>质控①首次失败</span><input type="checkbox" id="qc_nonneg_fail_first"></label>
+    <label><span>质控②对应 延迟 ms</span><input type="number" id="qc_match_delay_ms" min="0"></label>
+    <label><span>质控②首次失败</span><input type="checkbox" id="qc_match_fail_first"></label>
+    <label><span>取数超时 ms</span><input type="number" id="client_timeout_ms" min="100" step="100"></label>
+    <label><span>取数最大尝试</span><input type="number" id="max_attempts" min="1" max="6"></label>
+  </div>
+  <div style="margin-top:10px">
+    <button onclick="saveConfig()">应用配置</button>
+    <button class="ghost" onclick="loadConfig()">还原显示</button>
+    <span id="pushResult" class="muted"></span>
+  </div>
+</section>
+
+<section>
+  <h2>② 提交样品号清单(每行一个或逗号分隔,真实执行:取数 → 并行两项质控 → 入仓)</h2>
+  <textarea id="sampleIds" placeholder="S1001&#10;S1002&#10;S1003">S1001
+S1002
+S1003
+S1004
+S1005
+S1006</textarea>
+  <div style="margin-top:8px">
+    <button onclick="submitBatch()">提交批次</button>
+    <span class="muted" style="font-size:12px;margin-left:8px">
+      演示钩子:样品号含 NEG → 负浓度(质控①不通过);含 MIX → 返回错位样品号(质控②不通过)</span>
+  </div>
+</section>
+
+<section>
+  <h2>③ 批次列表(自动刷新;多批交错运行,记录互不串)</h2>
+  <table id="batchTable">
+    <thead><tr><th>批次</th><th>状态</th><th>样品数</th><th>入仓</th><th>墙钟 s</th>
+      <th>瓶颈判定</th><th>提交时间</th><th>操作</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section id="detail" hidden>
+  <h2 id="detailTitle">批次详情</h2>
+  <div id="conclBox"></div>
+  <div id="chainBox" style="margin-top:10px"></div>
+  <div id="stageBox" style="margin-top:10px"></div>
+  <h2 style="margin-top:14px">跨服务时间线(条块=一次真实调用;黄框=关键链)</h2>
+  <div class="legend">
+    <span><i class="sp-effective"></i>有效尝试</span><span><i class="sp-ok"></i>正常(质控/入仓)</span>
+    <span><i class="sp-failed"></i>失败/未通过</span><span><i class="sp-timeout"></i>超时放弃</span>
+    <span><i class="sp-late"></i>迟到(未采用)</span><span><i class="sp-running"></i>进行中</span>
+    <span class="muted">半透明细条=服务端上报跨度(含等名额)</span>
+  </div>
+  <div class="wf" id="wf"></div>
+  <div id="spansBox" style="margin-top:12px"></div>
+  <div id="whBox" style="margin-top:12px"></div>
+  <div style="margin-top:10px"><button onclick="rerun()">用当前配置重跑此批样品</button></div>
+</section>
+</main>
+
+<script>
+const STAGE_LABEL = {fetch:'取数', qc_nonneg:'质控①非负', qc_match:'质控②对应', warehouse:'入仓'};
+const STAGE_ORDER = {fetch:0, qc_nonneg:1, qc_match:2, warehouse:3};
+let currentBatch = null, currentDetail = null;
+
+function fmtTs(t){ if(!t) return '-'; const d=new Date(t*1000);
+  return d.toLocaleTimeString('zh-CN',{hour12:false})+'.'+String(d.getMilliseconds()).padStart(3,'0'); }
+
+async function loadConfig(){
+  const c = await (await fetch('/api/config')).json();
+  for(const k of Object.keys(c)){
+    const el = document.getElementById(k);
+    if(!el) continue;
+    if(el.type==='checkbox') el.checked = !!c[k]; else el.value = c[k];
+  }
+}
+async function saveConfig(){
+  const body = {};
+  for(const el of document.querySelectorAll('#cfgForm input')){
+    body[el.id] = el.type==='checkbox' ? el.checked : Number(el.value);
+  }
+  const r = await (await fetch('/api/config',{method:'POST',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})).json();
+  document.getElementById('pushResult').textContent =
+    '已下发 → 源站:'+r.push.source+'，质控:'+r.push.qc;
+}
+
+async function submitBatch(){
+  const ids = document.getElementById('sampleIds').value.split(/[\s,，;；]+/).filter(Boolean);
+  if(!ids.length){ alert('请填写样品号'); return; }
+  const r = await (await fetch('/api/batches',{method:'POST',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify({sample_ids:ids})})).json();
+  if(r.id){ openBatch(r.id); refreshBatches(); } else alert(r.error||'提交失败');
+}
+
+async function refreshBatches(){
+  const rows = await (await fetch('/api/batches')).json();
+  const tb = document.querySelector('#batchTable tbody');
+  tb.innerHTML = rows.map(b=>`<tr class="clickable" onclick="openBatch(${b.id})">
+    <td>#${b.id}</td><td><span class="pill st-${b.status}">${b.status}</span></td>
+    <td>${b.samples}</td><td>${b.stored??'-'}</td><td>${b.wall_s??'-'}</td>
+    <td>${b.bottleneck??'-'}</td><td class="mono">${fmtTs(b.created_at)}</td>
+    <td><button class="ghost" onclick="event.stopPropagation();openBatch(${b.id})">详情</button></td>
+  </tr>`).join('');
+  if(currentBatch!==null){
+    const cur = rows.find(x=>x.id===currentBatch);
+    if(cur && cur.status==='running') loadDetail(currentBatch);
+  }
+}
+
+async function openBatch(id){ currentBatch=id; await loadDetail(id); }
+async function loadDetail(id){
+  const d = await (await fetch('/api/batches/'+id)).json();
+  currentDetail = d;
+  document.getElementById('detail').hidden = false;
+  document.getElementById('detailTitle').textContent =
+    `批次 #${id} 详情(状态 ${d.batch.status},样品 ${d.batch.sample_ids.length} 个)`;
+  renderConclusion(d); renderChain(d); renderStages(d); renderWaterfall(d);
+  renderSpans(d); renderWarehouse(d);
+}
+
+function renderConclusion(d){
+  const c = d.conclusion;
+  document.getElementById('conclBox').innerHTML =
+    (d.batch.status==='running' || !c)
+    ? `<div class="concl">批次运行中,结论待定稿…(已完成阶段见下方时间线)</div>`
+    : `<div class="concl ${c.status==='done'?'':'fail'}">${c.text}</div>`;
+}
+
+function renderChain(d){
+  const c = d.conclusion;
+  if(d.batch.status==='running' || !c){
+    document.getElementById('chainBox').innerHTML=''; return;
+  }
+  if(!c.chain){
+    document.getElementById('chainBox').innerHTML = (c && c.blocking)
+      ? `<table><thead><tr><th>阻断样品</th><th>阻断环节</th><th>明细</th></tr></thead><tbody>`+
+        c.blocking.map(b=>`<tr><td class="mono">${b.sample_id}</td>
+          <td>${STAGE_LABEL[b.stage]||b.stage}</td><td>${b.detail}</td></tr>`).join('')+
+        `</tbody></table>` : '';
+    return;
+  }
+  const rows = c.chain.segments.map(s=>{
+    const dur=(s.end-s.start).toFixed(3);
+    return `<tr><td class="${s.kind==='wait'?'chain-wait':'chain-exec'}">${s.kind==='wait'?'等待':'执行'}</td>
+      <td>${s.label}</td><td>${dur} s</td><td class="muted">${s.note||''}</td></tr>`;
+  }).join('');
+  document.getElementById('chainBox').innerHTML =
+    `<b>决定完成时间的等待与执行链(样品 ${c.chain.sample_id},合计 ${c.chain.total_s}s;`+
+    `批次墙钟 ${c.wall_s}s):</b>
+     <table><thead><tr><th>类型</th><th>环节</th><th>耗时</th><th>说明</th></tr></thead>
+     <tbody>${rows}</tbody></table>`;
+}
+
+function renderStages(d){
+  const c = d.conclusion;
+  if(d.batch.status==='running' || !c || !c.per_stage){ document.getElementById('stageBox').innerHTML=''; return; }
+  const rows = Object.entries(c.per_stage).map(([k,v])=>
+    `<tr><td>${v.label}</td><td>${v.attempts}</td><td>${v.sum_s}</td><td>${v.wall_s}</td>
+     <td>${v.effective}</td><td>${v.failed}</td><td>${v.late}</td><td>${v.gave_up??0}</td></tr>`).join('');
+  document.getElementById('stageBox').innerHTML =
+    `<b>分阶段统计(求和≠墙钟:并行质控、重叠重试、多样品并行均不直接相加):</b>
+     <table><thead><tr><th>阶段</th><th>调用次数</th><th>耗时求和 s</th><th>墙钟跨度 s</th>
+     <th>有效</th><th>失败</th><th>迟到</th><th>曾超时放弃</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderWaterfall(d){
+  const spans = d.spans.filter(s=>s.start_ts);
+  const el = document.getElementById('wf');
+  if(!spans.length){ el.innerHTML='<span class="muted">暂无调用记录</span>'; return; }
+  const t0 = Math.min(...spans.map(s=>s.start_ts));
+  const t1 = Math.max(...spans.map(s=>s.end_ts||s.start_ts), t0+0.001);
+  const span = t1-t0;
+  const crit = new Set();
+  if(d.conclusion && d.conclusion.chain)
+    d.conclusion.chain.segments.forEach(g=>(g.span_ids||[]).forEach(i=>crit.add(i)));
+  const sorted = [...spans].sort((a,b)=>{
+    if(a.sample_id!==b.sample_id) return a.sample_id<b.sample_id?-1:1;
+    const o = STAGE_ORDER[a.stage]-STAGE_ORDER[b.stage]; if(o) return o;
+    if(a.side!==b.side) return a.side==='client'?-1:1;
+    return a.attempt-b.attempt || a.id-b.id;
+  });
+  let rows='';
+  for(const s of sorted){
+    const l=((s.start_ts-t0)/span*100), w=Math.max(((s.end_ts||s.start_ts)-s.start_ts)/span*100, .4);
+    const label = `${s.sample_id} · ${STAGE_LABEL[s.stage]||s.stage}`+
+      (s.stage==='fetch'?` #${s.attempt}`:'')+(s.side==='server'?` ↳${s.service}服务端`:'');
+    const dur = s.end_ts? ((s.end_ts-s.start_ts)*1000).toFixed(0)+'ms' : '…';
+    const tip = `${label}\n状态:${s.status}  耗时:${dur}`+
+      (s.queue_ms?`\n等名额:${s.queue_ms}ms`:'')+(s.note?`\n${s.note}`:'');
+    rows += `<div class="wf-row"><div class="wf-label" title="${tip}">${label}</div>
+      <div class="wf-track"><div class="wf-bar sp-${s.status} ${s.side==='server'?'server':''} ${crit.has(s.id)?'crit':''}"
+        style="left:${l}%;width:${w}%" title="${tip}"></div></div></div>`;
+  }
+  let ticks='';
+  for(let i=0;i<=5;i++){
+    const t=(span*i/5);
+    ticks += `<span style="left:${i/5*100}%">${t.toFixed(2)}s</span>`;
+  }
+  el.innerHTML = rows + `<div class="wf-axis">${ticks}</div>`;
+}
+
+function renderSpans(d){
+  if(!d.spans.length){ document.getElementById('spansBox').innerHTML=''; return; }
+  const rows = d.spans.map(s=>`<tr>
+    <td>${s.id}</td><td class="mono">${s.sample_id}</td><td>${STAGE_LABEL[s.stage]||s.stage}</td>
+    <td>${s.side==='server'?s.service+'服务端':'编排侧'}</td><td>${s.attempt}</td>
+    <td><span class="pill sp-${s.status}">${s.status}</span></td>
+    <td class="mono">+${((s.start_ts-d.spans[0].start_ts)*1000).toFixed(0)}ms</td>
+    <td>${s.end_ts?((s.end_ts-s.start_ts)*1000).toFixed(0)+'ms':'-'}</td>
+    <td>${s.queue_ms??''}</td><td class="mono" title="${s.request_id}">${s.request_id.slice(0,8)}</td>
+    <td class="muted" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+        title="${(s.note||'')}${s.detail?(' '+s.detail):''}">${(s.note||'')}</td></tr>`).join('');
+  document.getElementById('spansBox').innerHTML =
+    `<b>调用明细(${d.spans.length} 条,request_id 跨服务关联):</b>
+     <table><thead><tr><th>id</th><th>样品</th><th>阶段</th><th>侧</th><th>尝试</th><th>状态</th>
+     <th>相对开始</th><th>耗时</th><th>等名额ms</th><th>请求</th><th>备注</th></tr></thead>
+     <tbody>${rows}</tbody></table>`;
+}
+
+function renderWarehouse(d){
+  const rows = d.warehouse.map(w=>`<tr><td>${w.id}</td><td class="mono">${w.sample_id}</td>
+    <td>${w.concentration}</td><td class="mono">${fmtTs(w.stored_at)}</td>
+    <td class="mono" title="${w.request_id}">${w.request_id.slice(0,8)}</td></tr>`).join('');
+  document.getElementById('whBox').innerHTML =
+    `<b>入仓记录(${d.warehouse.length} 条,UNIQUE(批次,样品) 幂等,迟到结果不重复入仓):</b>
+     <table><thead><tr><th>id</th><th>样品</th><th>浓度</th><th>入仓时间</th><th>来源请求</th></tr></thead>
+     <tbody>${rows||'<tr><td colspan="5" class="muted">暂无</td></tr>'}</tbody></table>`;
+}
+
+async function rerun(){
+  if(!currentDetail) return;
+  const r = await (await fetch('/api/batches',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({sample_ids:currentDetail.batch.sample_ids})})).json();
+  if(r.id){ openBatch(r.id); refreshBatches(); }
+}
+
+loadConfig(); refreshBatches();
+setInterval(refreshBatches, 1500);
+</script>
+</body>
+</html>
